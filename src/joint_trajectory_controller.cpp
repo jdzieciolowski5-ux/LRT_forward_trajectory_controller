@@ -15,6 +15,7 @@
 #include "joint_trajectory_controller/joint_trajectory_controller.hpp"
 
 #include <chrono>
+#include <array> 
 #include <functional>
 #include <memory>
 
@@ -103,10 +104,21 @@ JointTrajectoryController::state_interface_configuration() const
 {
   controller_interface::InterfaceConfiguration conf;
   conf.type = controller_interface::interface_configuration_type::INDIVIDUAL;
-  conf.names.reserve(dof_ * params_.state_interfaces.size());
+  
+  // NOTE: For today's goal we want *fixed* state interfaces, independent of the
+  // `state_interfaces` parameter: always position + velocity + effort.
+  // This guarantees the controller always has P/V/E feedback available.
+
+  static const std::array<std::string, 3> kFixedStateInterfaces = {
+  hardware_interface::HW_IF_POSITION,
+  hardware_interface::HW_IF_VELOCITY,
+  hardware_interface::HW_IF_EFFORT,
+  };
+
+  conf.names.reserve(dof_ * kFixedStateInterfaces.size());
   for (const auto & joint_name : params_.joints)
   {
-    for (const auto & interface_type : params_.state_interfaces)
+    for (const auto & interface_type : kFixedStateInterfaces)
     {
       conf.names.push_back(joint_name + "/" + interface_type);
     }
@@ -129,10 +141,6 @@ controller_interface::return_type JointTrajectoryController::update(
     default_tolerances_ = get_segment_tolerances(logger, params_);
     // update the PID gains
     // variable use_closed_loop_pid_adapter_ is updated in on_configure only
-    if (use_closed_loop_pid_adapter_)
-    {
-      update_pids();
-    }
   }
 
   auto compute_error_for_joint = [&](
@@ -141,17 +149,7 @@ controller_interface::return_type JointTrajectoryController::update(
                                    const JointTrajectoryPoint & desired)
   {
     // error defined as the difference between current and desired
-    if (joints_angle_wraparound_[index])
-    {
-      // if desired, the shortest_angular_distance is calculated, i.e., the error is
-      //  normalized between -pi<error<pi
-      error.positions[index] =
-        angles::shortest_angular_distance(current.positions[index], desired.positions[index]);
-    }
-    else
-    {
-      error.positions[index] = desired.positions[index] - current.positions[index];
-    }
+    error.positions[index] = desired.positions[index] - current.positions[index];
     if (
       has_velocity_state_interface_ &&
       (has_velocity_command_interface_ || has_effort_command_interface_))
@@ -184,6 +182,20 @@ controller_interface::return_type JointTrajectoryController::update(
   auto assign_interface_from_point =
     [&](auto & joint_interface, const std::vector<double> & trajectory_point_interface)
   {
+    // Defensive check: never index out of bounds.
+    // If this happens, it means the sampled trajectory point doesn't provide this interface
+    // for all joints (e.g. effort missing while effort command interface is enabled).
+    if (trajectory_point_interface.size() != dof_)
+    {
+      RCLCPP_ERROR_THROTTLE(
+        get_node()->get_logger(),
+        *get_node()->get_clock(),
+        1000,  // ms
+        "Internal safety check: trajectory vector size (%zu) != dof_ (%zu). "
+        "Skipping command write to avoid out-of-range access.",
+        trajectory_point_interface.size(), dof_);
+      return;
+    }
     for (size_t index = 0; index < dof_; ++index)
     {
       joint_interface[index].get().set_value(trajectory_point_interface[index]);
@@ -206,12 +218,12 @@ controller_interface::return_type JointTrajectoryController::update(
       if (params_.open_loop_control)
       {
         traj_external_point_ptr_->set_point_before_trajectory_msg(
-          time, last_commanded_state_, joints_angle_wraparound_);
+          time, last_commanded_state_); //joints_angle_wraparound_); //usunalem joints_angle_wraparound_
       }
       else
       {
         traj_external_point_ptr_->set_point_before_trajectory_msg(
-          time, state_current_, joints_angle_wraparound_);
+          time, state_current_); //joints_angle_wraparound_); //usunalem joints_angle_wraparound_
       }
     }
 
@@ -290,35 +302,38 @@ controller_interface::return_type JointTrajectoryController::update(
       }
 
       // set values for next hardware write() if tolerance is met
+      
       if (!tolerance_violated_while_moving && within_goal_time)
       {
-        if (use_closed_loop_pid_adapter_)
-        {
-          // Update PIDs
-          for (auto i = 0ul; i < dof_; ++i)
-          {
-            tmp_command_[i] = (state_desired_.velocities[i] * ff_velocity_scale_[i]) +
-                              pids_[i]->computeCommand(
-                                state_error_.positions[i], state_error_.velocities[i],
-                                (uint64_t)period.nanoseconds());
-          }
-        }
+        // PE mode = position + effort command interfaces, but NO velocity command interface.
+        // Semantics: effort is the main command (torque control), position is only a reference.
+        // To avoid conflicting control modes, keep position_command neutral = current position.
+        const bool is_pe_mode =
+          has_position_command_interface_ &&
+          has_effort_command_interface_ &&
+          !has_velocity_command_interface_;
 
         // set values for next hardware write()
+
         if (has_position_command_interface_)
         {
-          assign_interface_from_point(joint_command_interface_[0], state_desired_.positions);
-        }
-        if (has_velocity_command_interface_)
-        {
-          if (use_closed_loop_pid_adapter_)
+          if (is_pe_mode)
           {
-            assign_interface_from_point(joint_command_interface_[1], tmp_command_);
+            // Neutral position command (variant 2): hold current position to avoid mode conflict.
+            assign_interface_from_point(joint_command_interface_[0], state_current_.positions);
           }
           else
           {
-            assign_interface_from_point(joint_command_interface_[1], state_desired_.velocities);
+            // Normal trajectory tracking: send desired position from interpolation.
+            assign_interface_from_point(joint_command_interface_[0], state_desired_.positions);
           }
+        }
+        
+        if (has_velocity_command_interface_)
+        {
+          // IMPORTANT (PVE fix): even when effort interface is present (and PID adapter is used),
+          // the velocity command interface must receive desired velocities, not tmp_command_ (PID/effort output).
+          assign_interface_from_point(joint_command_interface_[1], state_desired_.velocities);
         }
         if (has_acceleration_command_interface_)
         {
@@ -326,7 +341,7 @@ controller_interface::return_type JointTrajectoryController::update(
         }
         if (has_effort_command_interface_)
         {
-          assign_interface_from_point(joint_command_interface_[3], tmp_command_);
+          assign_interface_from_point(joint_command_interface_[3], state_desired_.effort); 
         }
 
         // store the previous command. Used in open-loop control mode
@@ -462,6 +477,8 @@ void JointTrajectoryController::read_state_from_state_interfaces(JointTrajectory
     state.velocities.clear();
     state.accelerations.clear();
   }
+  // We always expose effort as a state interface (P/V/E state).
+  assign_point_from_interface(state.effort, joint_state_interface_[3]); //dodałem tą linie
 }
 
 bool JointTrajectoryController::read_state_from_command_interfaces(JointTrajectoryPoint & state)
@@ -713,7 +730,7 @@ controller_interface::CallbackReturn JointTrajectoryController::on_configure(
   {
     itf.reserve(params_.joints.size());
   }
-
+  
   has_position_command_interface_ =
     contains_interface_type(params_.command_interfaces, hardware_interface::HW_IF_POSITION);
   has_velocity_command_interface_ =
@@ -723,38 +740,112 @@ controller_interface::CallbackReturn JointTrajectoryController::on_configure(
   has_effort_command_interface_ =
     contains_interface_type(params_.command_interfaces, hardware_interface::HW_IF_EFFORT);
 
-  // if there is only velocity or if there is effort command interface
-  // then use also PID adapter
-  use_closed_loop_pid_adapter_ =
-    (has_velocity_command_interface_ && params_.command_interfaces.size() == 1 &&
-     !params_.open_loop_control) ||
-    has_effort_command_interface_;
+  // === Fixed state interfaces ===
+  // We request and use fixed state interfaces independent of `params_.state_interfaces`:
+  // always position + velocity + effort, and never acceleration.
+  has_position_state_interface_ = true;
+  has_velocity_state_interface_ = true;
+  has_effort_state_interface_ = true;
+  has_acceleration_state_interface_ = false;
+  // === end of fixed state interfaces ===
 
-  if (use_closed_loop_pid_adapter_)
+  // === Command interfaces validation (today's goal) ===
+  // Allowed command interface combinations:
+  // 1) [position]
+  // 2) [position, velocity]
+  // 3) [position, effort]
+  // 4) [position, velocity, effort]
+  //
+  // Not allowed:
+  // - acceleration in command interfaces
+  // - velocity without position
+  // - effort without position
+  // - any other combination / size
+
+  if (has_acceleration_command_interface_)
   {
-    pids_.resize(dof_);
-    ff_velocity_scale_.resize(dof_);
-    tmp_command_.resize(dof_, 0.0);
-
-    update_pids();
+    RCLCPP_ERROR(
+      logger, "Command interface 'acceleration' is not allowed. "
+      "Allowed: [position], [position, velocity], [position, effort], [position, velocity, effort].");
+    return CallbackReturn::ERROR;
   }
 
-  // Configure joint position error normalization from ROS parameters (angle_wraparound)
-  joints_angle_wraparound_.resize(dof_);
-  for (size_t i = 0; i < dof_; ++i)
+  if (!has_position_command_interface_)
   {
-    const auto & gains = params_.gains.joints_map.at(params_.joints[i]);
-    if (gains.normalize_error)
+    RCLCPP_ERROR(
+      logger, "Command interface 'position' is required. "
+      "Allowed: [position], [position, velocity], [position, effort], [position, velocity, effort].");
+    return CallbackReturn::ERROR;
+  }
+
+  // With position present and acceleration absent, only optional parts are: velocity and/or effort.
+  // Therefore allowed sizes are 1, 2, or 3.
+  const auto cmd_size = params_.command_interfaces.size();
+  if (cmd_size < 1 || cmd_size > 3)
+  {
+    RCLCPP_ERROR(
+      logger, "Invalid number of command interfaces (%zu). "
+      "Allowed: 1..3 and only these combinations: "
+      "[position], [position, velocity], [position, effort], [position, velocity, effort].",
+      cmd_size);
+    return CallbackReturn::ERROR;
+  }
+
+  // Disallow velocity-only or effort-only (already indirectly blocked by requiring position,
+  // but keep explicit checks for clearer error messages if something changes later).
+  if (has_velocity_command_interface_ && !has_position_command_interface_)
+  {
+    RCLCPP_ERROR(logger, "Invalid command interfaces: 'velocity' without 'position' is not allowed.");
+    return CallbackReturn::ERROR;
+  }
+
+  if (has_effort_command_interface_ && !has_position_command_interface_)
+  {
+    RCLCPP_ERROR(logger, "Invalid command interfaces: 'effort' without 'position' is not allowed.");
+    return CallbackReturn::ERROR;
+  }
+
+  // Now validate the exact allowed combinations:
+  // - size==1 => must be [position]
+  if (cmd_size == 1)
+  {
+    if (!(has_position_command_interface_ && !has_velocity_command_interface_ && !has_effort_command_interface_))
     {
-      // TODO(anyone): Remove deprecation warning in the end of 2023
-      RCLCPP_INFO(logger, "`normalize_error` is deprecated, use `angle_wraparound` instead!");
-      joints_angle_wraparound_[i] = gains.normalize_error;
-    }
-    else
-    {
-      joints_angle_wraparound_[i] = gains.angle_wraparound;
+      RCLCPP_ERROR(
+        logger, "Invalid command interfaces. Allowed: "
+        "[position], [position, velocity], [position, effort], [position, velocity, effort].");
+      return CallbackReturn::ERROR;
     }
   }
+
+  // - size==2 => must be [position, velocity] OR [position, effort]
+  if (cmd_size == 2)
+  {
+    const bool is_pv = has_position_command_interface_ && has_velocity_command_interface_ && !has_effort_command_interface_;
+    const bool is_pe = has_position_command_interface_ && !has_velocity_command_interface_ && has_effort_command_interface_;
+    if (!(is_pv || is_pe))
+    {
+      RCLCPP_ERROR(
+        logger, "Invalid command interfaces. Allowed: "
+        "[position], [position, velocity], [position, effort], [position, velocity, effort].");
+      return CallbackReturn::ERROR;
+    }
+  }
+
+  // - size==3 => must be [position, velocity, effort]
+  if (cmd_size == 3)
+  {
+    const bool is_pve =
+      has_position_command_interface_ && has_velocity_command_interface_ && has_effort_command_interface_;
+    if (!is_pve)
+    {
+      RCLCPP_ERROR(
+        logger, "Invalid command interfaces. Allowed: "
+        "[position], [position, velocity], [position, effort], [position, velocity, effort].");
+      return CallbackReturn::ERROR;
+    }
+  }
+  // === end of command interfaces validation ===
 
   if (params_.state_interfaces.empty())
   {
@@ -979,13 +1070,20 @@ controller_interface::CallbackReturn JointTrajectoryController::on_activate(
       return CallbackReturn::ERROR;
     }
   }
-  for (const auto & interface : params_.state_interfaces)
-  {
-    auto it =
-      std::find(allowed_interface_types_.begin(), allowed_interface_types_.end(), interface);
+  
+  // NOTE: For today's goal we want *fixed* state interfaces (P/V/E), independent of the
+  // `state_interfaces` parameter.
+  static const std::array<std::string, 3> kFixedStateInterfaces = {
+    hardware_interface::HW_IF_POSITION,
+    hardware_interface::HW_IF_VELOCITY,
+    hardware_interface::HW_IF_EFFORT,
+  };
+
+  for (const auto & interface : kFixedStateInterfaces)
+  { 
+    auto it = std::find(allowed_interface_types_.begin(), allowed_interface_types_.end(), interface);
     auto index = static_cast<size_t>(std::distance(allowed_interface_types_.begin(), it));
-    if (!controller_interface::get_ordered_interfaces(
-          state_interfaces_, params_.joints, interface, joint_state_interface_[index]))
+    if (!controller_interface::get_ordered_interfaces(state_interfaces_, params_.joints, interface, joint_state_interface_[index]))
     {
       RCLCPP_ERROR(
         logger, "Expected %zu '%s' state interfaces, got %zu.", dof_, interface.c_str(),
@@ -1018,12 +1116,7 @@ controller_interface::CallbackReturn JointTrajectoryController::on_activate(
     read_state_from_state_interfaces(state_current_);
     read_state_from_state_interfaces(last_commanded_state_);
   }
-  // reset/zero out all of the PID's (The integral term is not retained and reset to zero)
-  for (auto & pid : pids_)
-  {
-    pid->reset();
-  }
-
+  
   // The controller should start by holding position at the beginning of active state
   add_new_trajectory_msg(set_hold_position());
   rt_is_holding_ = true;
@@ -1125,14 +1218,6 @@ bool JointTrajectoryController::reset()
 {
   subscriber_is_active_ = false;
   joint_command_subscriber_.reset();
-
-  for (const auto & pid : pids_)
-  {
-    if (pid)
-    {
-      pid->reset();
-    }
-  }
 
   traj_external_point_ptr_.reset();
 
@@ -1584,11 +1669,26 @@ bool JointTrajectoryController::validate_trajectory_msg(
       return false;
     }
     // reject effort entries
-    if (!points[i].effort.empty())
+
+   // Effort is treated as feed-forward from trajectory points.
+   // If the controller commands effort, every point must provide effort for all joints.
+    // If the controller does NOT command effort, reject trajectories containing effort (avoid silent ignore).
+    if (has_effort_command_interface_)
     {
-      RCLCPP_ERROR(
-        get_node()->get_logger(), "Trajectories with effort fields are currently not supported.");
-      return false;
+      if (!validate_trajectory_point_field(joint_count, points[i].effort, "effort", i, false))
+      {
+        return false;
+      }
+    }
+    else
+    {
+      if (!points[i].effort.empty())
+      {
+        RCLCPP_ERROR(
+          get_node()->get_logger(),
+          "Trajectory contains 'effort' but this controller instance is not configured with an effort command interface.");
+        return false;
+      }
     }
   }
   return true;
@@ -1618,6 +1718,14 @@ JointTrajectoryController::set_hold_position()
 {
   // Command to stay at current position
   hold_position_msg_ptr_->points[0].positions = state_current_.positions;
+
+  //dodalem warunek
+  if (has_effort_command_interface_)
+  {
+    // In hold mode we do not compute any closed-loop effort anymore (PID removed),
+    // so keep effort command well-defined (zeros) and correctly sized.
+    hold_position_msg_ptr_->points[0].effort.assign(dof_, 0.0);
+  }
 
   // set flag, otherwise tolerances will be checked with holding position too
   rt_is_holding_ = true;
@@ -1658,6 +1766,9 @@ void JointTrajectoryController::resize_joint_trajectory_point(
   {
     point.accelerations.resize(size, 0.0);
   }
+  // We always expose effort as a state interface (P/V/E state).
+  // Resize unconditionally so `read_state_from_state_interfaces()` can always write it.
+  point.effort.resize(size, 0.0); //dodalem ta linie
 }
 
 void JointTrajectoryController::resize_joint_trajectory_point_command(
@@ -1686,39 +1797,6 @@ bool JointTrajectoryController::has_active_trajectory() const
   return traj_external_point_ptr_ != nullptr && traj_external_point_ptr_->has_trajectory_msg();
 }
 
-void JointTrajectoryController::update_pids()
-{
-  for (size_t i = 0; i < dof_; ++i)
-  {
-    const auto & gains = params_.gains.joints_map.at(params_.joints[i]);
-    if (pids_[i])
-    {
-      // update PIDs with gains from ROS parameters
-      pids_[i]->setGains(gains.p, gains.i, gains.d, gains.i_clamp, -gains.i_clamp);
-    }
-    else
-    {
-      // Init PIDs with gains from ROS parameters
-      pids_[i] = std::make_shared<control_toolbox::Pid>(
-        gains.p, gains.i, gains.d, gains.i_clamp, -gains.i_clamp);
-    }
-    // Check deprecated style for "ff_velocity_scale" parameter definition.
-    if (gains.ff_velocity_scale == 0.0)
-    {
-      RCLCPP_WARN(
-        get_node()->get_logger(),
-        "'ff_velocity_scale' parameters is not defined under 'gains.<joint_name>.' structure. "
-        "Maybe you are using deprecated format 'ff_velocity_scale/<joint_name>'!");
-
-      ff_velocity_scale_[i] = auto_declare<double>("ff_velocity_scale/" + params_.joints[i], 0.0);
-    }
-    else
-    {
-      ff_velocity_scale_[i] = gains.ff_velocity_scale;
-    }
-  }
-}
-
 void JointTrajectoryController::init_hold_position_msg()
 {
   hold_position_msg_ptr_ = std::make_shared<trajectory_msgs::msg::JointTrajectory>();
@@ -1738,6 +1816,12 @@ void JointTrajectoryController::init_hold_position_msg()
   {
     // add velocity, so that trajectory sampling returns acceleration points in any case
     hold_position_msg_ptr_->points[0].accelerations.resize(dof_, 0.0);
+  }
+  // dodalem warunek
+  if (has_effort_command_interface_)
+  {
+    // add effort, so that trajectory sampling / command assignment has valid size in hold mode
+    hold_position_msg_ptr_->points[0].effort.resize(dof_, 0.0);
   }
 }
 
