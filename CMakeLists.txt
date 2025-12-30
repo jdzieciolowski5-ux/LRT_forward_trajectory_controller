@@ -8,7 +8,6 @@ endif()
 set(THIS_PACKAGE_INCLUDE_DEPENDS
     angles
     control_msgs
-    control_toolbox
     controller_interface
     generate_parameter_library
     hardware_interface
@@ -85,7 +84,6 @@ if(BUILD_TESTING)
   )
   ament_target_dependencies(test_load_joint_trajectory_controller
     controller_manager
-    control_toolbox
     realtime_tools
     ros2_control_test_assets
   )
