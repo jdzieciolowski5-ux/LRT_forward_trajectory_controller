@@ -226,6 +226,7 @@ void Trajectory::interpolate_between_points(
   output.positions.resize(dim, 0.0);
   output.velocities.resize(dim, 0.0);
   output.accelerations.resize(dim, 0.0);
+  output.effort.clear(); // Effort is optional and comes from trajectory if provided 
 
   auto generate_powers = [](int n, double x, double * powers)
   {
@@ -237,6 +238,7 @@ void Trajectory::interpolate_between_points(
   };
 
   bool has_velocity = !state_a.velocities.empty() && !state_b.velocities.empty();
+  bool has_effort = !state_a.effort.empty() && !state_b.effort.empty(); 
   bool has_accel = !state_a.accelerations.empty() && !state_b.accelerations.empty();
   if (duration_so_far.seconds() < 0.0)
   {
@@ -343,6 +345,30 @@ void Trajectory::interpolate_between_points(
       output.accelerations[i] = t[0] * 2.0 * coefficients[2] + t[1] * 6.0 * coefficients[3] +
                                 t[2] * 12.0 * coefficients[4] + t[3] * 20.0 * coefficients[5];
     }
+  }
+  // Feed-forward effort from trajectory.
+  // Interpolate effort linearly in time if both endpoints provide effort.
+  if (has_effort)
+  {
+    output.effort.resize(dim, 0.0);
+
+    const double total = duration_btwn_points.seconds();
+    double alpha = 0.0;
+    if (total > 0.0)
+    {
+      alpha = duration_so_far.seconds() / total;
+      if (alpha < 0.0) { alpha = 0.0; }
+      if (alpha > 1.0) { alpha = 1.0; }
+    }
+
+    for (size_t i = 0; i < dim; ++i)
+    {
+      output.effort[i] = state_a.effort[i] + alpha * (state_b.effort[i] - state_a.effort[i]);
+    }
+  }
+  else
+  {
+    output.effort.clear();
   }
 }
 
